@@ -5,7 +5,6 @@
 #include <raymath.h>
 #include <stdio.h>
 
-
 #define MAX_PROTESTERS 120
 #define MAX_POLICE 100
 #define MAX_PROJECTILES 1000
@@ -21,6 +20,11 @@
 #define PROTESTER_BULLET_HEALTH 4
 #define PROTESTER_MELEE_HEALTH 7
 #define POLICE_HEALTH 5
+#define HELICOPTER_HEALTH 20
+#define HELICOPTER_COOLDOWN 0.8f
+#define HELICOPTER_RANGE 800.0f
+#define HELICOPTER_SPEED 120.0f
+#define SPREAD_ANGLE 15.0f
 #define CAR_BARRIER_HEALTH 600
 #define CONCRETE_BARRIER_HEALTH 1200
 #define PROTESTER_COUNTDOWN 1.0f
@@ -45,10 +49,11 @@
 #define FLANKING_OFFSET 50.0f
 #define MORALE_PENALTY_DURATION 3.0f
 #define MORALE_PENALTY_FACTOR 0.7f
+#define DYING_DURATION 2.0f
 
 typedef enum { PROTESTER, POLICE } EntityType;
-typedef enum { IDLE, MOVING, ATTACKING, RETREATING, TAKING_COVER } AIState;
-typedef enum { SHOOTER, MELEE } PoliceType;
+typedef enum { IDLE, MOVING, ATTACKING, RETREATING, TAKING_COVER, DYING } AIState;
+typedef enum { SHOOTER, MELEE, HELICOPTER } PoliceType;
 typedef enum { CAR, CONCRETE } BarrierType;
 typedef enum { START, PLAYING, PROTESTER_WIN, POLICE_WIN } GameState;
 
@@ -69,6 +74,8 @@ typedef struct {
     bool is_taking_cover;
     int cover_barrier_id;
     float morale_penalty_timer;
+    Vector2 wander_target;
+    float wander_timer;
 } Entity;
 
 typedef struct {
@@ -97,43 +104,14 @@ typedef struct {
     int cover_cycle_phase;
 } Game;
 
-
 Entity protesters[MAX_PROTESTERS] = {0};
 Entity police[MAX_POLICE] = {0};
 Projectile projectiles[MAX_PROJECTILES] = {0};
 Barrier barriers[MAX_BARRIERS] = {0};
 Game game = {0};
 
-//update aug10
-#define MAX_GROUPS 4
-typedef struct {
-    int member_ids[MAX_PROTESTERS];
-    int member_count;
-    Vector2 target_position;
-    bool is_selected;
-} ProtesterGroup;
-
-ProtesterGroup groups[MAX_GROUPS];
-int selected_group = -1;
-
-void init_groups() {
-    // Evenly distribute protesters into groups
-    int per_group = MAX_PROTESTERS / MAX_GROUPS;
-    int idx = 0;
-    for (int g = 0; g < MAX_GROUPS; g++) {
-        groups[g].member_count = 0;
-        groups[g].is_selected = false;
-        groups[g].target_position = (Vector2){-1, -1};
-        for (int i = 0; i < per_group && idx < MAX_PROTESTERS; i++, idx++) {
-            groups[g].member_ids[groups[g].member_count++] = idx;
-        }
-    }
-}
-
-
 int selected_entity = -1;
 EntityType selected_type = PROTESTER;
-
 
 float distance(Vector2 p1, Vector2 p2) {
     return sqrtf((p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y));
@@ -142,11 +120,9 @@ float distance(Vector2 p1, Vector2 p2) {
 bool point_near_line(Vector2 point, Vector2 line_start, Vector2 line_end, float threshold) {
     float line_length = distance(line_start, line_end);
     if (line_length == 0) return false;
-
     float t = ((point.x - line_start.x) * (line_end.x - line_start.x) + 
                (point.y - line_start.y) * (line_end.y - line_start.y)) / (line_length * line_length);
     t = fmaxf(0, fminf(1, t));
-
     Vector2 projection = {line_start.x + t * (line_end.x - line_start.x),
                           line_start.y + t * (line_end.y - line_start.y)};
     return distance(point, projection) < threshold;
@@ -177,7 +153,11 @@ void init_entity(Entity *entity, Vector2 pos, EntityType type, PoliceType police
     entity->velocity = (Vector2){0, 0};
     entity->type = type;
     entity->police_type = police_type;
-    entity->bullet_health = (type == PROTESTER) ? PROTESTER_BULLET_HEALTH : POLICE_HEALTH;
+    if (type == POLICE && police_type == HELICOPTER) {
+        entity->bullet_health = HELICOPTER_HEALTH;
+    } else {
+        entity->bullet_health = (type == PROTESTER) ? PROTESTER_BULLET_HEALTH : POLICE_HEALTH;
+    }
     entity->melee_health = (type == PROTESTER) ? PROTESTER_MELEE_HEALTH : 0;
     entity->active = true;
     entity->ai_state = ATTACKING;
@@ -189,6 +169,8 @@ void init_entity(Entity *entity, Vector2 pos, EntityType type, PoliceType police
     entity->is_taking_cover = false;
     entity->cover_barrier_id = -1;
     entity->morale_penalty_timer = 0.0f;
+    entity->wander_target = (Vector2){0, 0};
+    entity->wander_timer = 0.0f;
 }
 
 void init_barrier(Barrier *barrier, Vector2 pos, BarrierType type) {
@@ -210,18 +192,17 @@ void init_game() {
     game.last_police_count = 0;
     game.police_defeat_timer = 0.0f;
     game.cover_cycle_phase = 0;
-
     for (int i = 0; i < 80; i++) {
         Vector2 pos = {100 + (rand() % 600), 50 + (rand() % 620)};
         init_entity(&protesters[i], pos, PROTESTER, SHOOTER);
     }
-
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 59; i++) {
         Vector2 pos = {680 + (rand() % 500), 50 + (rand() % 620)};
         init_entity(&police[i], pos, POLICE, (rand() % 2 == 0) ? SHOOTER : MELEE);
     }
+    Vector2 heli_pos = {900, 360};
+    init_entity(&police[59], heli_pos, POLICE, HELICOPTER);
     game.last_police_count = 60;
-
     for (int i = 0; i < MAX_BARRIERS; i++) {
         barriers[i].active = false;
     }
@@ -237,10 +218,7 @@ void init_game() {
         init_barrier(&barriers[barrier_index], pos, (rand() % 2 == 0) ? CAR : CONCRETE);
         barrier_index++;
     }
-    init_groups();
-
 }
-
 
 void spawn_entity(Entity *entities, int max_entities, Vector2 pos, EntityType type, PoliceType police_type) {
     for (int i = 0; i < max_entities; i++) {
@@ -282,13 +260,12 @@ void fire_projectile(Vector2 pos, Vector2 dir, EntityType type, Entity *entity) 
     }
 }
 
-
 Vector2 compute_flocking(Entity *entity, int index, Entity *entities, int max_entities) {
     Vector2 alignment = {0, 0};
     Vector2 cohesion = {0, 0};
     int count = 0;
     for (int i = 0; i < max_entities; i++) {
-        if (i != index && entities[i].active && entities[i].ai_state != RETREATING && !entities[i].is_taking_cover) {
+        if (i != index && entities[i].active && entities[i].ai_state != RETREATING && !entities[i].is_taking_cover && entities[i].ai_state != DYING) {
             float dist = distance(entity->position, entities[i].position);
             if (dist < FLOCKING_RADIUS && dist > 0) {
                 alignment = Vector2Add(alignment, entities[i].velocity);
@@ -348,11 +325,11 @@ Vector2 find_densest_enemy_area(Entity *entity, EntityType type) {
     Vector2 center = {0, 0};
     float max_score = 0;
     for (int i = 0; i < max_enemies; i++) {
-        if (enemies[i].active) {
+        if (enemies[i].active && enemies[i].ai_state != DYING) {
             int count = 0;
             Vector2 sum = {0, 0};
             for (int j = 0; j < max_enemies; j++) {
-                if (enemies[j].active && distance(enemies[i].position, enemies[j].position) < DENSITY_RADIUS) {
+                if (enemies[j].active && enemies[j].ai_state != DYING && distance(enemies[i].position, enemies[j].position) < DENSITY_RADIUS) {
                     sum = Vector2Add(sum, enemies[j].position);
                     count++;
                 }
@@ -377,7 +354,7 @@ void find_closest_enemy(Entity *entity, EntityType type, float *closest_dist, in
     *closest_dist = 10000.0f;
     *closest_enemy = -1;
     for (int i = 0; i < max_enemies; i++) {
-        if (enemies[i].active && (!type == PROTESTER || !enemies[i].is_taking_cover)) {
+        if (enemies[i].active && enemies[i].ai_state != DYING && (!type == PROTESTER || !enemies[i].is_taking_cover)) {
             float dist = distance(entity->position, enemies[i].position);
             float score = dist;
             if (type == PROTESTER) {
@@ -392,21 +369,17 @@ void find_closest_enemy(Entity *entity, EntityType type, float *closest_dist, in
     }
 }
 
-
 void update_morale() {
     int active_protesters = 0, active_police = 0;
     for (int i = 0; i < MAX_PROTESTERS; i++) if (protesters[i].active) active_protesters++;
-    for (int i = 0; i < MAX_POLICE; i++) if (police[i].active) active_police++;
-    
+    for (int i = 0; i < MAX_POLICE; i++) if (police[i].active && police[i].ai_state != DYING) active_police++;
     if (game.last_police_count - active_police > 5 && game.police_defeat_timer <= 0) {
         game.police_defeat_timer = MORALE_PENALTY_DURATION;
     }
     game.last_police_count = active_police;
-
     float total = active_protesters + active_police;
     game.protester_morale = total > 0 ? (float)active_protesters / total : 0.5f;
     game.police_morale = total > 0 ? (float)active_police / total : 0.5f;
-    
     for (int i = 0; i < MAX_PROTESTERS; i++) {
         if (protesters[i].active) {
             protesters[i].morale_boost = 1.0f + 0.2f * game.protester_morale;
@@ -434,7 +407,6 @@ void update_protester_cover() {
         for (int i = 0; i < MAX_PROTESTERS; i++) {
             if (protesters[i].active && !protesters[i].is_player_controlled) active_protesters++;
         }
-
         int cover_count;
         switch (game.cover_cycle_phase) {
             case 0: cover_count = 8; break;
@@ -443,14 +415,12 @@ void update_protester_cover() {
             default: cover_count = (active_protesters > 0) ? (rand() % (active_protesters > 15 ? 15 : active_protesters)) + 3 : 0; break;
         }
         game.cover_cycle_phase = (game.cover_cycle_phase + 1) % 4;
-
         for (int i = 0; i < MAX_PROTESTERS; i++) {
             if (protesters[i].active && !protesters[i].is_player_controlled) {
                 protesters[i].is_taking_cover = false;
                 protesters[i].cover_barrier_id = -1;
             }
         }
-        
         for (int i = 0; i < cover_count; i++) {
             int index = rand() % MAX_PROTESTERS;
             int attempts = 0;
@@ -522,21 +492,17 @@ void update_police_combat(Entity *entity, float closest_dist, int closest_enemy,
 
 void update_protester_ai(Entity *entity, int index) {
     if (!entity->active || entity->is_player_controlled) return;
-
     if (entity->cooldown > 0) entity->cooldown -= GetFrameTime();
     if (entity->animation_timer > 0) entity->animation_timer -= GetFrameTime();
-
     float closest_dist;
     int closest_enemy;
     Vector2 target_pos;
     find_closest_enemy(entity, PROTESTER, &closest_dist, &closest_enemy, &target_pos);
-
     Vector2 police_territory_target = {PROTESTER_TERRITORY_X, entity->position.y};
-
     if (entity->is_taking_cover && entity->cover_barrier_id != -1 && barriers[entity->cover_barrier_id].active) {
         entity->ai_state = TAKING_COVER;
         Vector2 barrier_pos = {barriers[entity->cover_barrier_id].start.x, 
-                              (barriers[entity->cover_barrier_id].start.y + barriers[entity->cover_barrier_id].end.y) / 2};
+                       (barriers[entity->cover_barrier_id].start.y + barriers[entity->cover_barrier_id].end.y) / 2};
         float dist_to_cover = distance(entity->position, barrier_pos);
         if (dist_to_cover > 5.0f) {
             Vector2 dir = Vector2Subtract(barrier_pos, entity->position);
@@ -552,11 +518,9 @@ void update_protester_ai(Entity *entity, int index) {
         Vector2 center_dir = {0, SCREEN_HEIGHT / 2 - entity->position.y};
         center_dir = Vector2Normalize(center_dir);
         center_dir = Vector2Scale(center_dir, ENTITY_SPEED * 0.05f * entity->morale_boost);
-
         Vector2 advance_dir = Vector2Subtract(police_territory_target, entity->position);
         advance_dir = Vector2Normalize(advance_dir);
         advance_dir = Vector2Scale(advance_dir, ENTITY_SPEED * 0.8f * entity->morale_boost);
-
         if (health_ratio < RETREAT_HEALTH_THRESHOLD && closest_enemy != -1) {
             entity->ai_state = RETREATING;
             Vector2 dir = Vector2Subtract(entity->position, target_pos);
@@ -577,15 +541,12 @@ void update_protester_ai(Entity *entity, int index) {
             entity->velocity = Vector2Add(entity->velocity, center_dir);
         }
     }
-
     Vector2 avoidance = avoid_collisions(entity, index, protesters, MAX_PROTESTERS);
     Vector2 flocking = compute_flocking(entity, index, protesters, MAX_PROTESTERS);
     entity->velocity = Vector2Add(entity->velocity, avoidance);
     entity->velocity = Vector2Add(entity->velocity, Vector2Scale(flocking, 0.3f));
-
     Vector2 prev_velocity = entity->velocity;
     Vector2 new_pos = Vector2Add(entity->position, Vector2Scale(entity->velocity, GetFrameTime()));
-
     bool collision = false;
     for (int i = 0; i < MAX_BARRIERS; i++) {
         if (barriers[i].active && point_near_line(new_pos, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
@@ -593,62 +554,14 @@ void update_protester_ai(Entity *entity, int index) {
             break;
         }
     }
-
     if (!collision) {
-    entity->position = new_pos;
-    entity->velocity = Vector2Add(Vector2Scale(entity->velocity, 0.7f), Vector2Scale(prev_velocity, 0.3f));
-} else {
-    // --- Improved sliding collision ---
-    bool moved = false;
-
-    // Try sliding along X
-    Vector2 slide_dir_x = { entity->velocity.x, 0 };
-    if (Vector2Length(slide_dir_x) > 0) {
-        Vector2 slide_pos_x = Vector2Add(entity->position, Vector2Scale(slide_dir_x, GetFrameTime()));
-        bool x_blocked = false;
-        for (int i = 0; i < MAX_BARRIERS; i++) {
-            if (barriers[i].active && point_near_line(slide_pos_x, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
-                x_blocked = true;
-                break;
-            }
-        }
-        if (!x_blocked) {
-            entity->position = slide_pos_x;
-            moved = true;
-        }
+        entity->position = new_pos;
+        entity->velocity = Vector2Add(Vector2Scale(entity->velocity, 0.7f), Vector2Scale(prev_velocity, 0.3f));
+    } else {
+        Vector2 dir = Vector2Normalize(Vector2Subtract(entity->position, (Vector2){new_pos.x, entity->position.y}));
+        entity->position = Vector2Add(entity->position, Vector2Scale(dir, 10.0f * GetFrameTime()));
+        entity->velocity = Vector2Scale(dir, ENTITY_SPEED * entity->morale_boost);
     }
-
-    // If X slide failed, try sliding along Y
-    if (!moved) {
-        Vector2 slide_dir_y = { 0, entity->velocity.y };
-        if (Vector2Length(slide_dir_y) > 0) {
-            Vector2 slide_pos_y = Vector2Add(entity->position, Vector2Scale(slide_dir_y, GetFrameTime()));
-            bool y_blocked = false;
-            for (int i = 0; i < MAX_BARRIERS; i++) {
-                if (barriers[i].active && point_near_line(slide_pos_y, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
-                    y_blocked = true;
-                    break;
-                }
-            }
-            if (!y_blocked) {
-                entity->position = slide_pos_y;
-                moved = true;
-            }
-        }
-    }
-
-    // If both slide attempts failed, push entity away from barrier
-    if (!moved) {
-        Vector2 push_dir = Vector2Normalize(Vector2Subtract(entity->position, new_pos));
-        entity->position = Vector2Add(entity->position, Vector2Scale(push_dir, 10.0f * GetFrameTime()));
-    }
-
-    // Stop movement after collision resolution to avoid jitter
-    entity->velocity = (Vector2){0, 0};
-}
-
-
-
     if (entity->position.x < COVER_WIDTH) entity->position.x = COVER_WIDTH;
     if (entity->position.x > SCREEN_WIDTH - COVER_WIDTH) entity->position.x = SCREEN_WIDTH - COVER_WIDTH;
     if (entity->position.y < COVER_HEIGHT / 2) entity->position.y = COVER_HEIGHT / 2;
@@ -657,15 +570,53 @@ void update_protester_ai(Entity *entity, int index) {
 
 void update_police_ai(Entity *entity, int index) {
     if (!entity->active) return;
-
     if (entity->cooldown > 0) entity->cooldown -= GetFrameTime();
     if (entity->animation_timer > 0) entity->animation_timer -= GetFrameTime();
-
+    if (entity->ai_state == DYING) {
+        entity->position.y += 200.0f * GetFrameTime();
+        if (entity->animation_timer <= 0) {
+            entity->active = false;
+        }
+        return;
+    }
+    if (entity->police_type == HELICOPTER) {
+        if (entity->wander_timer <= 0 || distance(entity->position, entity->wander_target) < 20.0f) {
+            entity->wander_target.x = 600 + (rand() % (SCREEN_WIDTH - 600));
+            entity->wander_target.y = 50 + (rand() % (SCREEN_HEIGHT - 100));
+            entity->wander_timer = 3.0f + ((float)rand() / RAND_MAX) * 4.0f;
+        }
+        entity->wander_timer -= GetFrameTime();
+        Vector2 dir = Vector2Subtract(entity->wander_target, entity->position);
+        if (Vector2Length(dir) > 0) {
+            dir = Vector2Normalize(dir);
+            entity->velocity = Vector2Scale(dir, HELICOPTER_SPEED * entity->morale_boost);
+        } else {
+            entity->velocity = (Vector2){0, 0};
+        }
+        float closest_dist;
+        int closest_enemy;
+        Vector2 target_pos;
+        find_closest_enemy(entity, POLICE, &closest_dist, &closest_enemy, &target_pos);
+        if (closest_enemy != -1 && closest_dist < HELICOPTER_RANGE && entity->cooldown <= 0) {
+            Vector2 shoot_dir = Vector2Normalize(Vector2Subtract(target_pos, entity->position));
+            fire_projectile(entity->position, shoot_dir, POLICE, entity);
+            fire_projectile(entity->position, Vector2Rotate(shoot_dir, SPREAD_ANGLE), POLICE, entity);
+            fire_projectile(entity->position, Vector2Rotate(shoot_dir, -SPREAD_ANGLE), POLICE, entity);
+            entity->cooldown = HELICOPTER_COOLDOWN;
+            entity->animation_timer = ANIMATION_DURATION;
+        }
+        Vector2 new_pos = Vector2Add(entity->position, Vector2Scale(entity->velocity, GetFrameTime()));
+        entity->position = new_pos;
+        if (entity->position.x < 0) entity->position.x = 0;
+        if (entity->position.x > SCREEN_WIDTH) entity->position.x = SCREEN_WIDTH;
+        if (entity->position.y < 0) entity->position.y = 0;
+        if (entity->position.y > SCREEN_HEIGHT) entity->position.y = SCREEN_HEIGHT;
+        return;
+    }
     float closest_dist;
     int closest_enemy;
     Vector2 target_pos;
     find_closest_enemy(entity, POLICE, &closest_dist, &closest_enemy, &target_pos);
-
     if (closest_enemy != -1) {
         update_police_combat(entity, closest_dist, closest_enemy, target_pos);
     } else {
@@ -676,15 +627,12 @@ void update_police_ai(Entity *entity, int index) {
         entity->velocity = (entity->police_type == SHOOTER) ? (Vector2){0, 0} : 
                            Vector2Scale(dir, ENTITY_SPEED * entity->morale_boost);
     }
-
     Vector2 avoidance = avoid_collisions(entity, index, police, MAX_POLICE);
     Vector2 flocking = compute_flocking(entity, index, police, MAX_POLICE);
     entity->velocity = Vector2Add(entity->velocity, avoidance);
     entity->velocity = Vector2Add(entity->velocity, flocking);
-
     Vector2 prev_velocity = entity->velocity;
     Vector2 new_pos = Vector2Add(entity->position, Vector2Scale(entity->velocity, GetFrameTime()));
-
     bool collision = false;
     for (int i = 0; i < MAX_BARRIERS; i++) {
         if (barriers[i].active && point_near_line(new_pos, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
@@ -692,100 +640,45 @@ void update_police_ai(Entity *entity, int index) {
             break;
         }
     }
-
-    if (!collision) {
-    entity->position = new_pos;
-    entity->velocity = Vector2Add(Vector2Scale(entity->velocity, 0.7f), Vector2Scale(prev_velocity, 0.3f));
-} else {
-    // --- Improved sliding collision ---
-    bool moved = false;
-
-    // Try sliding along X
-    Vector2 slide_dir_x = { entity->velocity.x, 0 };
-    if (Vector2Length(slide_dir_x) > 0) {
-        Vector2 slide_pos_x = Vector2Add(entity->position, Vector2Scale(slide_dir_x, GetFrameTime()));
-        bool x_blocked = false;
-        for (int i = 0; i < MAX_BARRIERS; i++) {
-            if (barriers[i].active && point_near_line(slide_pos_x, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
-                x_blocked = true;
-                break;
-            }
-        }
-        if (!x_blocked) {
-            entity->position = slide_pos_x;
-            moved = true;
-        }
-    }
-
-    // If X slide failed, try sliding along Y
-    if (!moved) {
-        Vector2 slide_dir_y = { 0, entity->velocity.y };
-        if (Vector2Length(slide_dir_y) > 0) {
-            Vector2 slide_pos_y = Vector2Add(entity->position, Vector2Scale(slide_dir_y, GetFrameTime()));
-            bool y_blocked = false;
-            for (int i = 0; i < MAX_BARRIERS; i++) {
-                if (barriers[i].active && point_near_line(slide_pos_y, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
-                    y_blocked = true;
-                    break;
-                }
-            }
-            if (!y_blocked) {
-                entity->position = slide_pos_y;
-                moved = true;
-            }
-        }
-    }
-
-    // If both slide attempts failed, push entity away from barrier
-    if (!moved) {
-        Vector2 push_dir = Vector2Normalize(Vector2Subtract(entity->position, new_pos));
-        entity->position = Vector2Add(entity->position, Vector2Scale(push_dir, 10.0f * GetFrameTime()));
-    }
-
-    // Stop movement after collision resolution to avoid jitter
-    entity->velocity = (Vector2){0, 0};
-}
-
-
-if (entity->position.x < COVER_WIDTH) entity->position.x = COVER_WIDTH;
-if (entity->position.x > SCREEN_WIDTH - COVER_WIDTH) entity->position.x = SCREEN_WIDTH - COVER_WIDTH;
-if (entity->position.y < COVER_HEIGHT / 2) entity->position.y = COVER_HEIGHT / 2;
-if (entity->position.y > SCREEN_HEIGHT - COVER_HEIGHT / 2) entity->position.y = SCREEN_HEIGHT - COVER_HEIGHT / 2;
-}
-
-void update_player_controlled(Entity *entity) {
-    if (!entity->active) return;
-
-    entity->velocity = (Vector2){0, 0};
-    float speed = ENTITY_SPEED * entity->morale_boost;
-
-    if (IsKeyDown(KEY_W)) entity->velocity.y -= speed;
-    if (IsKeyDown(KEY_S)) entity->velocity.y += speed;
-    if (IsKeyDown(KEY_A)) entity->velocity.x -= speed;
-    if (IsKeyDown(KEY_D)) entity->velocity.x += speed;
-
-    Vector2 new_pos = Vector2Add(entity->position, Vector2Scale(entity->velocity, GetFrameTime()));
-    
-    bool collision = false;
-    for (int i = 0; i < MAX_BARRIERS; i++) {
-        if (barriers[i].active && point_near_line(new_pos, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
-            collision = true;
-            break;
-        }
-    }
-    
     if (!collision) {
         entity->position = new_pos;
+        entity->velocity = Vector2Add(Vector2Scale(entity->velocity, 0.7f), Vector2Scale(prev_velocity, 0.3f));
+    } else {
+        Vector2 dir = Vector2Normalize(Vector2Subtract(entity->position, (Vector2){new_pos.x, entity->position.y}));
+        entity->position = Vector2Add(entity->position, Vector2Scale(dir, 10.0f * GetFrameTime()));
+        entity->velocity = Vector2Scale(dir, ENTITY_SPEED * entity->morale_boost);
     }
-
     if (entity->position.x < COVER_WIDTH) entity->position.x = COVER_WIDTH;
     if (entity->position.x > SCREEN_WIDTH - COVER_WIDTH) entity->position.x = SCREEN_WIDTH - COVER_WIDTH;
     if (entity->position.y < COVER_HEIGHT / 2) entity->position.y = COVER_HEIGHT / 2;
     if (entity->position.y > SCREEN_HEIGHT - COVER_HEIGHT / 2) entity->position.y = SCREEN_HEIGHT - COVER_HEIGHT / 2;
+}
 
+void update_player_controlled(Entity *entity) {
+    if (!entity->active) return;
+    entity->velocity = (Vector2){0, 0};
+    float speed = ENTITY_SPEED * entity->morale_boost;
+    if (IsKeyDown(KEY_W)) entity->velocity.y -= speed;
+    if (IsKeyDown(KEY_S)) entity->velocity.y += speed;
+    if (IsKeyDown(KEY_A)) entity->velocity.x -= speed;
+    if (IsKeyDown(KEY_D)) entity->velocity.x += speed;
+    Vector2 new_pos = Vector2Add(entity->position, Vector2Scale(entity->velocity, GetFrameTime()));
+    bool collision = false;
+    for (int i = 0; i < MAX_BARRIERS; i++) {
+        if (barriers[i].active && point_near_line(new_pos, barriers[i].start, barriers[i].end, COVER_WIDTH)) {
+            collision = true;
+            break;
+        }
+    }
+    if (!collision) {
+        entity->position = new_pos;
+    }
+    if (entity->position.x < COVER_WIDTH) entity->position.x = COVER_WIDTH;
+    if (entity->position.x > SCREEN_WIDTH - COVER_WIDTH) entity->position.x = SCREEN_WIDTH - COVER_WIDTH;
+    if (entity->position.y < COVER_HEIGHT / 2) entity->position.y = COVER_HEIGHT / 2;
+    if (entity->position.y > SCREEN_HEIGHT - COVER_HEIGHT / 2) entity->position.y = SCREEN_HEIGHT - COVER_HEIGHT / 2;
     if (entity->cooldown > 0) entity->cooldown -= GetFrameTime();
     if (entity->animation_timer > 0) entity->animation_timer -= GetFrameTime();
-
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && entity->cooldown <= 0) {
         Vector2 mouse_pos = GetMousePosition();
         Vector2 dir = {mouse_pos.x - entity->position.x, mouse_pos.y - entity->position.y};
@@ -800,24 +693,19 @@ void update_projectiles() {
             projectiles[i].position.x += projectiles[i].velocity.x * GetFrameTime();
             projectiles[i].position.y += projectiles[i].velocity.y * GetFrameTime();
             projectiles[i].distance_traveled += Vector2Length(projectiles[i].velocity) * GetFrameTime();
-
             if (projectiles[i].distance_traveled > (projectiles[i].type == PROTESTER ? STONE_RANGE : BULLET_RANGE)) {
                 projectiles[i].active = false;
                 continue;
             }
-
             for (int j = 0; j < MAX_BARRIERS; j++) {
                 if (barriers[j].active && point_near_line(projectiles[i].position, barriers[j].start, barriers[j].end, COVER_WIDTH)) {
                     projectiles[i].active = false;
                     break;
                 }
             }
-
             if (!projectiles[i].active) continue;
-
             Entity *targets = (projectiles[i].type == PROTESTER) ? police : protesters;
             int max_targets = (projectiles[i].type == PROTESTER) ? MAX_POLICE : MAX_PROTESTERS;
-
             for (int j = 0; j < max_targets; j++) {
                 if (targets[j].active) {
                     float dist = distance(projectiles[i].position, targets[j].position);
@@ -825,7 +713,13 @@ void update_projectiles() {
                         targets[j].bullet_health -= (projectiles[i].type == PROTESTER) ? 2 : 1;
                         targets[j].animation_timer = ANIMATION_DURATION;
                         if (targets[j].bullet_health <= 0 || (targets[j].type == PROTESTER && targets[j].melee_health <= 0)) {
-                            targets[j].active = false;
+                            if (targets[j].type == POLICE && targets[j].police_type == HELICOPTER) {
+                                targets[j].ai_state = DYING;
+                                targets[j].animation_timer = DYING_DURATION;
+                                targets[j].velocity = (Vector2){0, 200.0f};
+                            } else {
+                                targets[j].active = false;
+                            }
                         }
                         projectiles[i].active = false;
                         break;
@@ -837,6 +731,17 @@ void update_projectiles() {
 }
 
 void check_game_conditions() {
+    bool helicopter_alive = false;
+    for (int i = 0; i < MAX_POLICE; i++) {
+        if (police[i].active && police[i].police_type == HELICOPTER && police[i].ai_state != DYING) {
+            helicopter_alive = true;
+            break;
+        }
+    }
+    if (!helicopter_alive) {
+        game.state = PROTESTER_WIN;
+        return;
+    }
     int active_protesters = 0;
     int protesters_in_territory = 0;
     for (int i = 0; i < MAX_PROTESTERS; i++) {
@@ -847,12 +752,10 @@ void check_game_conditions() {
             }
         }
     }
-
     int active_police = 0;
     for (int i = 0; i < MAX_POLICE; i++) {
-        if (police[i].active) active_police++;
+        if (police[i].active && police[i].ai_state != DYING) active_police++;
     }
-
     if (active_protesters == 0) {
         game.state = POLICE_WIN;
         return;
@@ -861,7 +764,6 @@ void check_game_conditions() {
         game.state = PROTESTER_WIN;
         return;
     }
-
     if (protesters_in_territory > 0) {
         game.territory_hold_timer += GetFrameTime();
         if (game.territory_hold_timer >= WIN_HOLD_TIME) {
@@ -872,7 +774,6 @@ void check_game_conditions() {
     }
 }
 
-// Rendering Functions
 void draw_health_bar(Vector2 pos, int health, int max_health, Color c) {
     float width = 20.0f;
     float height = 4.0f;
@@ -918,13 +819,48 @@ void draw_entities() {
     for (int i = 0; i < MAX_POLICE; i++) {
         if (police[i].active) {
             float scale = 1.0f + 0.2f * (police[i].animation_timer / ANIMATION_DURATION);
-            if (police[i].police_type == SHOOTER) {
+            if (police[i].police_type == HELICOPTER) {
+                Vector2 pos = police[i].position;
+                if (police[i].ai_state == DYING) {
+                    for (int k = 0; k < 5; k++) {
+                        float offset_x = sinf(GetTime() * 10 + k) * 10.0f;
+                        float offset_y = cosf(GetTime() * 10 + k) * 10.0f;
+                        Vector2 exp_pos = {pos.x + offset_x, pos.y + offset_y};
+                        float exp_size = 15.0f * (1.0f - police[i].animation_timer / DYING_DURATION);
+                        DrawCircleV(exp_pos, exp_size, ORANGE);
+                    }
+                }
+                DrawRectangleRounded((Rectangle){pos.x - 30, pos.y - 10, 60, 20}, 0.5, 10, BLUE);
+                DrawRectangle(pos.x + 30, pos.y - 3, 25, 5, BLUE);
+                float tail_angle = GetTime() * 720;
+                Vector2 tail_center = {pos.x + 50, pos.y};
+                for (int k = 0; k < 2; k++) {
+                    float a = tail_angle + k * 180;
+                    Vector2 end = {tail_center.x + cosf(a * DEG2RAD) * 7, tail_center.y + sinf(a * DEG2RAD) * 7};
+                    DrawLineV(tail_center, end, BLACK);
+                }
+                Vector2 rotor_center = {pos.x, pos.y};
+                float rotor_angle = GetTime() * 360;
+                DrawCircle(rotor_center.x, rotor_center.y, 4, GRAY);
+                for (int k = 0; k < 4; k++) {
+                    float a = rotor_angle + k * 90;
+                    Vector2 end = {rotor_center.x + cosf(a * DEG2RAD) * 35, rotor_center.y + sinf(a * DEG2RAD) * 35};
+                    DrawLineEx(rotor_center, end, 3, BLACK);
+                }
+              DrawRectangle(pos.x - 28, pos.y - 8, 8, 8, YELLOW);
+              DrawRectangle(pos.x - 28, pos.y - (-3), 8, 8, YELLOW);
+
+                if (police[i].ai_state != DYING) {
+                    draw_health_bar((Vector2){pos.x, pos.y + 20}, police[i].bullet_health, HELICOPTER_HEALTH, GREEN);
+                }
+            } else if (police[i].police_type == SHOOTER) {
                 DrawCircleV(police[i].position, 10.0f * scale, BLUE);
+                draw_health_bar(police[i].position, police[i].bullet_health, POLICE_HEALTH, GREEN);
             } else {
                 DrawRectangleV(Vector2Subtract(police[i].position, (Vector2){10.0f * scale, 10.0f * scale}), 
                                (Vector2){20.0f * scale, 20.0f * scale}, BLUE);
+                draw_health_bar(police[i].position, police[i].bullet_health, POLICE_HEALTH, GREEN);
             }
-            draw_health_bar(police[i].position, police[i].bullet_health, POLICE_HEALTH, GREEN);
         }
     }
 }
@@ -953,7 +889,7 @@ void draw_ui() {
         }
     }
     for (int i = 0; i < MAX_POLICE; i++) {
-        if (police[i].active) {
+        if (police[i].active && police[i].ai_state != DYING) {
             active_police++;
             if (police[i].ai_state == ATTACKING) attacking_police++;
         }
@@ -986,51 +922,48 @@ void draw_end_screen() {
     DrawText("Press SPACE to Restart", SCREEN_WIDTH / 2 - MeasureText("Press SPACE to Restart", 20) / 2, SCREEN_HEIGHT / 2, 20, BLACK);
 }
 
-// aug10 edited this
 void handle_selection() {
-    // Select group by number key (1..MAX_GROUPS)
-    for (int g = 0; g < MAX_GROUPS; g++) {
-        if (IsKeyPressed(KEY_ONE + g)) {
-            for (int k = 0; k < MAX_GROUPS; k++) groups[k].is_selected = false;
-            groups[g].is_selected = true;
-            selected_group = g;
-        }
-    }
-
-    // Right click sets movement target for selected group
-    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && selected_group != -1) {
-        groups[selected_group].target_position = GetMousePosition();
-    }
-}
-
-//aug10 added this
-void update_group_ai() {
-    for (int g = 0; g < MAX_GROUPS; g++) {
-        if (groups[g].target_position.x < 0) continue;
-        for (int m = 0; m < groups[g].member_count; m++) {
-            int id = groups[g].member_ids[m];
-            if (!protesters[id].active) continue;
-            protesters[id].is_player_controlled = false; // Force AI override
-            Vector2 dir = Vector2Subtract(groups[g].target_position, protesters[id].position);
-            float dist = Vector2Length(dir);
-            if (dist > 5.0f) {
-                dir = Vector2Normalize(dir);
-                protesters[id].velocity = Vector2Scale(dir, ENTITY_SPEED);
-                protesters[id].position = Vector2Add(protesters[id].position, Vector2Scale(protesters[id].velocity, GetFrameTime()));
+    if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+        Vector2 mouse_pos = GetMousePosition();
+        float closest_dist = 50.0f;
+        int closest_entity = -1;
+        EntityType closest_type = PROTESTER;
+        for (int i = 0; i < MAX_PROTESTERS; i++) {
+            if (protesters[i].active) {
+                float dist = distance(mouse_pos, protesters[i].position);
+                if (dist < closest_dist) {
+                    closest_dist = dist;
+                    closest_entity = i;
+                    closest_type = PROTESTER;
+                }
             }
         }
+        if (closest_entity != -1) {
+            if (selected_entity != -1) {
+                Entity *prev_selected = &protesters[selected_entity];
+                prev_selected->is_player_controlled = false;
+            }
+            selected_entity = closest_entity;
+            selected_type = PROTESTER;
+            Entity *new_selected = &protesters[selected_entity];
+            new_selected->is_player_controlled = true;
+            new_selected->is_taking_cover = false;
+            new_selected->cover_barrier_id = -1;
+            new_selected->ai_state = MOVING;
+        } else {
+            if (selected_entity != -1) {
+                Entity *prev_selected = &protesters[selected_entity];
+                prev_selected->is_player_controlled = false;
+            }
+            selected_entity = -1;
+        }
     }
 }
 
-void NewFunction(Entity *selected);
-
-void update_game()
-{
+void update_game() {
     update_morale();
     update_protester_cover();
     handle_selection();
-    update_group_ai();
-
     for (int i = 0; i < MAX_PROTESTERS; i++) {
         if (protesters[i].active && !protesters[i].is_player_controlled) {
             update_protester_ai(&protesters[i], i);
@@ -1044,18 +977,13 @@ void update_game()
     if (selected_entity != -1) {
         Entity *selected = &protesters[selected_entity];
         if (selected->active) {
-            NewFunction(selected);
+            update_player_controlled(selected);
         } else {
             selected_entity = -1;
         }
     }
     update_projectiles();
     check_game_conditions();
-}
-
-void NewFunction(Entity *selected)
-{
-    update_player_controlled(selected);
 }
 
 void reset_game() {
@@ -1081,7 +1009,6 @@ int main() {
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "Protest Simulation");
     SetTargetFPS(60);
     init_game();
-
     while (!WindowShouldClose()) {
         BeginDrawing();
         switch (game.state) {
@@ -1105,7 +1032,6 @@ int main() {
         }
         EndDrawing();
     }
-
     CloseWindow();
     return 0;
 }
